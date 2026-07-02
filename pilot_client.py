@@ -1,0 +1,351 @@
+"""
+pilot_client.py
+----------------
+O Host do PILOTO. Fluxo:
+
+  1. Registra-se no relay dizendo qual ROV quer controlar.
+  2. AUTENTICA-SE por desafio-resposta HMAC (a senha nunca vai pela rede).
+  3. Se autenticar, pede o controle do ROV (o relay garante exclusão mútua:
+     só um piloto por ROV).
+  4. Envia COMANDOS (canal confiável) e recebe TELEMETRIA (canal
+     não-confiável) em tempo real.
+  5. FAILOVER: se o relay atual cair, troca para o backup, re-autentica e
+     retoma o controle automaticamente.
+
+Separa a lógica (PilotNode) da interface (run_gui).
+"""
+
+import argparse
+import threading
+import time
+
+import quiclite as q
+from protocol import compute_response, PILOT_CREDENTIALS
+
+HEARTBEAT_INTERVAL = 1.0
+FAILOVER_TIMEOUT = 6.0  # maior que o PRIMARY_TIMEOUT do relay (backup assume antes)
+
+
+class PilotNode:
+    def __init__(self, pilot_id, password, target, relays, loss=0.0, on_event=None):
+        self.pilot_id = pilot_id
+        self.password = password
+        self.target = target
+        self.relays = relays
+        self.idx = 0
+        self.current = relays[0]
+        self.loss = loss
+        self.on_event = on_event
+
+        self.endpoint = None
+        self.running = False
+        self.authed = False
+        self.controlling = None
+        self.last_relay_seen = time.time()
+        self._connect_started = False
+
+    # -- infraestrutura -----------------------------------------------------
+    def start(self, autoconnect=True):
+        """
+        Prepara o socket/transporte, mas só INICIA A CONVERSA com o relay se
+        autoconnect=True. Na interface gráfica passamos autoconnect=False, para
+        que a conexão (registro + autenticação + pedido de controle) só comece
+        quando o usuário clicar em "Conectar" — assim dá para mostrar o
+        processo ao vivo na apresentação.
+        """
+        sock = q.make_udp_socket(("0.0.0.0", 0))
+        self.endpoint = q.Endpoint(sock, self._on_message, loss=self.loss,
+                                   name=f"pilot-{self.pilot_id}")
+        self.running = True
+        if autoconnect:
+            self.connect()
+        else:
+            self._emit({"kind": "conn", "state": "idle"})
+
+    def connect(self):
+        """Inicia de fato a comunicação: registro -> auth -> pedido de controle."""
+        if self._connect_started:
+            return
+        self._connect_started = True
+        self._register()
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        threading.Thread(target=self._failover_monitor, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        if self.endpoint:
+            self.endpoint.close()
+
+    def _emit(self, event):
+        if self.on_event:
+            self.on_event(event)
+
+    def _log(self, text):
+        print(f"[pilot-{self.pilot_id}] {text}")
+        self._emit({"kind": "log", "text": text})
+
+    def _register(self):
+        self.authed = False
+        self.controlling = None
+        self.last_relay_seen = time.time()
+        self.endpoint.send_reliable(self.current, {
+            "type": "register", "role": "pilot",
+            "id": self.pilot_id, "target": self.target,
+        })
+        self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
+                    "state": "connecting"})
+        self._log(f"registrando em {self.current[0]}:{self.current[1]}…")
+
+    # -- ações do piloto (chamadas pela interface) -------------------------
+    def send_command(self, action, value):
+        if not self.authed:
+            self._log("ainda não autenticado — comando ignorado")
+            return
+        if not self.controlling:
+            self._log("sem controle de nenhum ROV — comando ignorado")
+            return
+        self.endpoint.send_reliable(self.current,
+                                    {"type": "command", "action": action, "value": value})
+        self._log(f"comando enviado: {action} = {value}")
+
+    def release_control(self):
+        if self.controlling:
+            self.endpoint.send_reliable(self.current, {"type": "release_control"})
+            self._log(f"controle de '{self.controlling}' liberado")
+            self.controlling = None
+            self._emit({"kind": "control", "state": "released"})
+
+    # -- recepção -----------------------------------------------------------
+    def _on_message(self, addr, msg, reliable):
+        if addr == self.current:
+            self.last_relay_seen = time.time()
+        mtype = msg.get("type")
+
+        if mtype == "registered":
+            self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
+                        "state": "connected"})
+        elif mtype == "auth_challenge":
+            # Responde ao desafio: HMAC(senha, nonce). A senha não trafega.
+            nonce = msg.get("nonce")
+            resp = compute_response(self.password, nonce)
+            self.endpoint.send_reliable(self.current, {"type": "auth_response", "response": resp})
+            self._log("desafio recebido — respondendo (HMAC do nonce)…")
+        elif mtype == "auth_ok":
+            self.authed = True
+            self._log(f"AUTENTICADO no relay (token {str(msg.get('token'))[:8]}…)")
+            self._emit({"kind": "auth", "state": "ok"})
+        elif mtype == "auth_fail":
+            self.authed = False
+            self._log(f"AUTENTICAÇÃO FALHOU: {msg.get('reason')}")
+            self._emit({"kind": "auth", "state": "fail", "reason": msg.get("reason")})
+        elif mtype == "control_granted":
+            self.controlling = msg.get("rov")
+            self._log(f"controle CONCEDIDO sobre '{self.controlling}'")
+            self._emit({"kind": "control", "state": "granted", "rov": self.controlling})
+        elif mtype == "control_denied":
+            self._log(f"controle NEGADO sobre '{msg.get('rov')}': {msg.get('reason')}")
+            self._emit({"kind": "control", "state": "denied", "reason": msg.get("reason")})
+        elif mtype == "telemetry":
+            self._emit({"kind": "telemetry", "rov": msg.get("rov"),
+                        "battery": msg.get("battery"), "depth": msg.get("depth"),
+                        "temperature": msg.get("temperature"),
+                        "thruster_power": msg.get("thruster_power")})
+        elif mtype == "rov_offline":
+            self._log(f"AVISO: ROV '{msg.get('rov')}' ficou OFFLINE")
+            self._emit({"kind": "control", "state": "rov_offline", "rov": msg.get("rov")})
+            self.controlling = None
+        elif mtype == "relay_heartbeat":
+            pass
+        elif mtype == "error":
+            self._log(f"erro do relay: {msg.get('message')}")
+
+    # -- laços periódicos ---------------------------------------------------
+    def _heartbeat_loop(self):
+        while self.running:
+            self.endpoint.send_unreliable(self.current, {"type": "heartbeat"})
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    def _failover_monitor(self):
+        while self.running:
+            time.sleep(0.5)
+            if len(self.relays) < 2:
+                continue
+            if time.time() - self.last_relay_seen > FAILOVER_TIMEOUT:
+                self._failover()
+
+    def _failover(self):
+        old = self.current
+        self.endpoint.remove_peer(old)
+        self.idx = (self.idx + 1) % len(self.relays)
+        self.current = self.relays[self.idx]
+        self._log(f"relay {old[0]}:{old[1]} não responde — FAILOVER para "
+                  f"{self.current[0]}:{self.current[1]}")
+        self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
+                    "state": "failover"})
+        self._register()  # re-registra, re-autentica e re-pede controle
+
+
+# ===========================================================================
+# INTERFACE GRÁFICA
+# ===========================================================================
+def run_gui(node, corner):
+    import queue
+    import tkinter as tk
+    import gui_common as g
+
+    ui_q = queue.Queue()
+    node.on_event = ui_q.put
+
+    root = g.make_root(f"PILOTO — {node.pilot_id}", corner, 400, 600)
+
+    # Botão de conexão manual: a conversa com o relay só começa ao clicar aqui,
+    # para dar para mostrar o processo (registro/auth/controle) ao vivo.
+    def do_connect():
+        conn_btn.config(state="disabled", text="conectando…")
+        node.connect()
+
+    conn_btn = tk.Button(root, text="🔌 Conectar ao relay", command=do_connect,
+                         bg=g.ACCENT, fg="#0f1117", activebackground=g.ACCENT,
+                         relief="flat", font=("Segoe UI", 11, "bold"), pady=8)
+    conn_btn.pack(fill="x", padx=10, pady=(8, 4))
+
+    conn_lbl = tk.Label(root, text="desconectado — clique em Conectar",
+                        font=("Segoe UI", 10, "bold"), bg=g.BG, fg=g.MUTE)
+    conn_lbl.pack(fill="x", pady=(6, 0))
+    auth_lbl = tk.Label(root, text="não autenticado", font=("Segoe UI", 10, "bold"),
+                        bg=g.BG, fg=g.MUTE)
+    auth_lbl.pack(fill="x")
+    ctrl_lbl = tk.Label(root, text=f"alvo: {node.target} (sem controle)",
+                        font=("Segoe UI", 10, "bold"), bg=g.BG, fg=g.MUTE)
+    ctrl_lbl.pack(fill="x", pady=(0, 6))
+
+    # Painel de telemetria
+    tele = tk.Frame(root, bg="#11151c")
+    tele.pack(fill="x", padx=10, pady=4)
+    tele_val = {}
+    for name in ("battery", "depth", "temperature", "thruster_power"):
+        row = tk.Frame(tele, bg="#11151c")
+        row.pack(fill="x", padx=8, pady=2)
+        label = {"battery": "Bateria", "depth": "Profundidade",
+                 "temperature": "Temperatura", "thruster_power": "Thruster"}[name]
+        tk.Label(row, text=label, width=12, anchor="w", bg="#11151c", fg=g.FG,
+                 font=("Segoe UI", 10)).pack(side="left")
+        v = tk.Label(row, text="—", anchor="e", bg="#11151c", fg=g.ACCENT,
+                     font=("Consolas", 11, "bold"))
+        v.pack(side="right")
+        tele_val[name] = v
+
+    # Controles
+    ctl = tk.Frame(root, bg=g.BG)
+    ctl.pack(fill="x", padx=10, pady=8)
+    tk.Label(ctl, text="Potência", bg=g.BG, fg=g.FG,
+             font=("Segoe UI", 9)).pack(anchor="w")
+    power = tk.Scale(ctl, from_=0, to=100, orient="horizontal", bg=g.BG, fg=g.FG,
+                     troughcolor="#11151c", highlightthickness=0, length=360)
+    power.set(50)
+    power.pack(fill="x")
+
+    btns = tk.Frame(root, bg=g.BG)
+    btns.pack(fill="x", padx=10)
+
+    def cmd_frente():
+        node.send_command("thruster_frente", int(power.get()))
+
+    def cmd_re():
+        node.send_command("thruster_re", int(power.get()))
+
+    def cmd_parar():
+        node.send_command("parar", 0)
+
+    def mkbtn(parent, text, color, fn):
+        b = tk.Button(parent, text=text, command=fn, bg=color, fg="#0f1117",
+                      activebackground=color, relief="flat", font=("Segoe UI", 10, "bold"),
+                      width=8, pady=6)
+        return b
+
+    mkbtn(btns, "▲ Frente", g.OKC, cmd_frente).pack(side="left", expand=True, fill="x", padx=2)
+    mkbtn(btns, "▼ Ré", g.ACCENT, cmd_re).pack(side="left", expand=True, fill="x", padx=2)
+    mkbtn(btns, "■ Parar", g.WARN, cmd_parar).pack(side="left", expand=True, fill="x", padx=2)
+    tk.Button(root, text="Soltar controle", command=node.release_control, bg="#37474f",
+              fg=g.FG, relief="flat", font=("Segoe UI", 9)).pack(fill="x", padx=10, pady=(6, 0))
+
+    tk.Label(root, text="Registro de eventos", bg=g.BG, fg=g.ACCENT,
+             font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+    log = g.make_log(root, height=8)
+    log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def handle(item):
+        k = item["kind"]
+        if k == "log":
+            g.log_append(log, item["text"])
+        elif k == "conn":
+            txt = {"idle": "desconectado — clique em Conectar",
+                   "connecting": f"conectando a {item.get('relay','')}…",
+                   "connected": f"● relay {item.get('relay','')}",
+                   "failover": f"↻ failover → {item.get('relay','')}"}.get(item["state"], "")
+            conn_lbl.config(text=txt,
+                            fg={"connected": g.OKC, "failover": g.WARN}.get(item["state"], g.MUTE))
+        elif k == "auth":
+            if item["state"] == "ok":
+                auth_lbl.config(text="autenticado ✓", fg=g.OKC)
+            else:
+                auth_lbl.config(text=f"autenticação falhou: {item.get('reason','')}", fg=g.BAD)
+        elif k == "control":
+            st = item["state"]
+            if st == "granted":
+                ctrl_lbl.config(text=f"controlando: {item['rov']} ✓", fg=g.OKC)
+            elif st == "denied":
+                ctrl_lbl.config(text=f"controle negado: {item.get('reason','')}", fg=g.BAD)
+            elif st == "released":
+                ctrl_lbl.config(text=f"alvo: {node.target} (controle liberado)", fg=g.MUTE)
+            elif st == "rov_offline":
+                ctrl_lbl.config(text=f"ROV '{item.get('rov')}' OFFLINE", fg=g.BAD)
+        elif k == "telemetry":
+            tele_val["battery"].config(text=f"{item['battery']} %")
+            tele_val["depth"].config(text=f"{item['depth']} m")
+            tele_val["temperature"].config(text=f"{item['temperature']} °C")
+            tele_val["thruster_power"].config(text=f"{item['thruster_power']}")
+
+    g.start_pump(root, ui_q, handle)
+    node.start(autoconnect=False)  # só conecta quando clicar em "Conectar"
+    root.protocol("WM_DELETE_WINDOW", lambda: (node.stop(), root.destroy()))
+    root.mainloop()
+
+
+def parse_addr(s):
+    host, port = s.split(":")
+    return (host, int(port))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cliente do piloto")
+    ap.add_argument("--id", default="pilotoA")
+    ap.add_argument("--password", default=None,
+                    help="senha do piloto (se omitida, usa a de demonstração)")
+    ap.add_argument("--target", default="rov1")
+    ap.add_argument("--relays", default="127.0.0.1:5000,127.0.0.1:5001")
+    ap.add_argument("--loss", type=float, default=0.0)
+    ap.add_argument("--corner", default="br")
+    ap.add_argument("--no-gui", action="store_true")
+    args = ap.parse_args()
+
+    password = args.password
+    if password is None:
+        password = PILOT_CREDENTIALS.get(args.id, "senha-invalida")
+
+    relays = [parse_addr(s) for s in args.relays.split(",")]
+    node = PilotNode(args.id, password, args.target, relays, loss=args.loss)
+
+    if args.no_gui:
+        node.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            node.stop()
+    else:
+        run_gui(node, args.corner)
+
+
+if __name__ == "__main__":
+    main()

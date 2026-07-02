@@ -1,0 +1,286 @@
+"""
+rov_simulator.py
+-----------------
+Finge ser o ROV (já que não temos o hardware). Ele:
+
+  1. Registra-se em um relay (o primário) e passa a mandar TELEMETRIA
+     periódica (bateria, profundidade, temperatura) pelo canal
+     NÃO-CONFIÁVEL — se um pacote se perde, o próximo já traz dado novo.
+  2. Recebe COMANDOS do piloto (via relay) pelo canal CONFIÁVEL e atualiza
+     seu estado físico simulado.
+  3. Manda heartbeat para o relay saber que está vivo.
+  4. FAILOVER: monitora os "relay_heartbeat". Se o relay atual ficar mudo
+     (caiu), o ROV troca sozinho para o relay backup e se re-registra —
+     mantendo seu estado interno (bateria, profundidade) intacto.
+
+Separa a lógica (RovNode) da interface (run_gui) para permitir teste headless.
+"""
+
+import argparse
+import random
+import threading
+import time
+
+import quiclite as q
+
+TELEMETRY_INTERVAL = 1.5
+HEARTBEAT_INTERVAL = 1.0
+FAILOVER_TIMEOUT = 6.0    # relay mudo por mais que isso => trocar de relay
+# (maior que o PRIMARY_TIMEOUT do relay, para o backup assumir antes)
+
+
+class RovState:
+    """Estado físico simulado do ROV."""
+
+    def __init__(self):
+        self.battery = 100.0
+        self.depth = 0.0
+        self.temperature = 18.0
+        self.thruster_power = 0
+        self.lock = threading.Lock()
+
+    def apply_command(self, action, value):
+        with self.lock:
+            if action == "thruster_frente":
+                self.thruster_power = value
+                self.depth = self.depth + 0.3 * (value / 100)
+            elif action == "thruster_re":
+                self.thruster_power = -value
+                self.depth = max(0.0, self.depth - 0.3 * (value / 100))
+            elif action == "parar":
+                self.thruster_power = 0
+
+    def tick(self):
+        with self.lock:
+            consumo = 0.05 + abs(self.thruster_power) * 0.001
+            self.battery = max(0.0, self.battery - consumo)
+            self.temperature = 18.0 + random.uniform(-0.3, 0.3)
+
+    def snapshot(self):
+        with self.lock:
+            return {"battery": round(self.battery, 1),
+                    "depth": round(self.depth, 2),
+                    "temperature": round(self.temperature, 1),
+                    "thruster_power": self.thruster_power}
+
+
+class RovNode:
+    def __init__(self, rov_id, relays, loss=0.0, on_event=None):
+        self.rov_id = rov_id
+        self.relays = relays            # lista de (ip, porta), [primário, backup]
+        self.idx = 0
+        self.current = relays[0]
+        self.loss = loss
+        self.on_event = on_event
+
+        self.state = RovState()
+        self.endpoint = None
+        self.running = False
+        self.registered = False
+        self.last_relay_seen = time.time()
+        self.relay_role = "?"
+
+    # -- infraestrutura -----------------------------------------------------
+    def start(self):
+        sock = q.make_udp_socket(("0.0.0.0", 0))  # porta efêmera qualquer
+        self.endpoint = q.Endpoint(sock, self._on_message, loss=self.loss,
+                                   name=f"rov-{self.rov_id}")
+        self.running = True
+        self._register()
+        threading.Thread(target=self._telemetry_loop, daemon=True).start()
+        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
+        threading.Thread(target=self._failover_monitor, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        if self.endpoint:
+            self.endpoint.close()
+
+    def _emit(self, event):
+        if self.on_event:
+            self.on_event(event)
+
+    def _log(self, text):
+        print(f"[rov-{self.rov_id}] {text}")
+        self._emit({"kind": "log", "text": text})
+
+    def _register(self):
+        self.registered = False
+        self.last_relay_seen = time.time()
+        self.endpoint.send_reliable(self.current,
+                                    {"type": "register", "role": "rov", "id": self.rov_id})
+        self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
+                    "state": "connecting"})
+        self._log(f"registrando em {self.current[0]}:{self.current[1]}…")
+
+    # -- recepção -----------------------------------------------------------
+    def _on_message(self, addr, msg, reliable):
+        if addr == self.current:
+            self.last_relay_seen = time.time()
+        mtype = msg.get("type")
+        if mtype == "registered":
+            self.registered = True
+            self._log(f"conectado ao relay {self.current[0]}:{self.current[1]}")
+            self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
+                        "state": "connected"})
+        elif mtype == "command":
+            action, value = msg.get("action"), msg.get("value")
+            self.state.apply_command(action, value)
+            self._log(f"comando de '{msg.get('from')}': {action} = {value}")
+            self._emit({"kind": "command", "from": msg.get("from"),
+                        "action": action, "value": value})
+            self._emit({"kind": "telemetry", **self.state.snapshot()})
+        elif mtype == "relay_heartbeat":
+            self.relay_role = msg.get("role", "?")
+        elif mtype == "error":
+            self._log(f"erro do relay: {msg.get('message')}")
+
+    # -- laços periódicos ---------------------------------------------------
+    def _telemetry_loop(self):
+        while self.running:
+            self.state.tick()
+            snap = self.state.snapshot()
+            # Telemetria vai pelo canal NÃO-CONFIÁVEL (último valor vence).
+            self.endpoint.send_unreliable(self.current, {"type": "telemetry", **snap})
+            self._emit({"kind": "telemetry", **snap})
+            time.sleep(TELEMETRY_INTERVAL)
+
+    def _heartbeat_loop(self):
+        while self.running:
+            self.endpoint.send_unreliable(self.current, {"type": "heartbeat"})
+            time.sleep(HEARTBEAT_INTERVAL)
+
+    def _failover_monitor(self):
+        while self.running:
+            time.sleep(0.5)
+            if len(self.relays) < 2:
+                continue
+            if time.time() - self.last_relay_seen > FAILOVER_TIMEOUT:
+                self._failover()
+
+    def _failover(self):
+        old = self.current
+        self.endpoint.remove_peer(old)
+        self.idx = (self.idx + 1) % len(self.relays)
+        self.current = self.relays[self.idx]
+        self._log(f"relay {old[0]}:{old[1]} não responde — FAILOVER para "
+                  f"{self.current[0]}:{self.current[1]}")
+        self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
+                    "state": "failover"})
+        self._register()
+
+
+# ===========================================================================
+# INTERFACE GRÁFICA
+# ===========================================================================
+def run_gui(node, corner):
+    import queue
+    import tkinter as tk
+    from tkinter import ttk
+    import gui_common as g
+
+    ui_q = queue.Queue()
+    node.on_event = ui_q.put
+
+    root = g.make_root(f"ROV — {node.rov_id}", corner, 380, 520)
+
+    conn_lbl = tk.Label(root, text="desconectado", font=("Segoe UI", 11, "bold"),
+                        bg=g.BG, fg=g.MUTE, pady=6)
+    conn_lbl.pack(fill="x")
+
+    frame = tk.Frame(root, bg=g.BG)
+    frame.pack(fill="x", padx=14, pady=6)
+
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("bat.Horizontal.TProgressbar", troughcolor="#11151c",
+                    background=g.OKC)
+    style.configure("dep.Horizontal.TProgressbar", troughcolor="#11151c",
+                    background=g.ACCENT)
+
+    def gauge(parent, name):
+        row = tk.Frame(parent, bg=g.BG)
+        row.pack(fill="x", pady=4)
+        tk.Label(row, text=name, width=12, anchor="w", bg=g.BG, fg=g.FG,
+                 font=("Segoe UI", 10)).pack(side="left")
+        val = tk.Label(row, text="—", width=10, anchor="e", bg=g.BG, fg=g.ACCENT,
+                       font=("Consolas", 11, "bold"))
+        val.pack(side="right")
+        return val
+
+    bat_bar = ttk.Progressbar(frame, style="bat.Horizontal.TProgressbar",
+                              maximum=100, length=340)
+    bat_bar.pack(fill="x", pady=(2, 0))
+    bat_val = gauge(frame, "Bateria")
+    dep_bar = ttk.Progressbar(frame, style="dep.Horizontal.TProgressbar",
+                              maximum=50, length=340)
+    dep_bar.pack(fill="x", pady=(8, 0))
+    dep_val = gauge(frame, "Profundidade")
+    tmp_val = gauge(frame, "Temperatura")
+    thr_val = gauge(frame, "Thruster")
+
+    tk.Label(root, text="Registro de eventos", bg=g.BG, fg=g.ACCENT,
+             font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(8, 0))
+    log = g.make_log(root, height=10)
+    log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def handle(item):
+        k = item["kind"]
+        if k == "log":
+            g.log_append(log, item["text"])
+        elif k == "conn":
+            txt = {"connecting": f"conectando a {item['relay']}…",
+                   "connected": f"● online via {item['relay']}",
+                   "failover": f"↻ failover → {item['relay']}"}.get(item["state"], "")
+            color = {"connected": g.OKC, "failover": g.WARN}.get(item["state"], g.MUTE)
+            conn_lbl.config(text=txt, fg=color)
+        elif k == "telemetry":
+            bat = item["battery"]
+            bat_bar["value"] = bat
+            bat_val.config(text=f"{bat:.1f} %",
+                           fg=g.OKC if bat > 25 else g.BAD)
+            dep_bar["value"] = min(item["depth"], 50)
+            dep_val.config(text=f"{item['depth']:.2f} m")
+            tmp_val.config(text=f"{item['temperature']:.1f} °C")
+            thr_val.config(text=f"{item['thruster_power']}")
+
+    g.start_pump(root, ui_q, handle)
+    node.start()
+    root.protocol("WM_DELETE_WINDOW", lambda: (node.stop(), root.destroy()))
+    root.mainloop()
+
+
+def parse_addr(s):
+    host, port = s.split(":")
+    return (host, int(port))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ROV simulado")
+    ap.add_argument("--id", default="rov1")
+    ap.add_argument("--relays", default="127.0.0.1:5000,127.0.0.1:5001",
+                    help="lista de relays separados por vírgula (primário,backup)")
+    ap.add_argument("--loss", type=float, default=0.0)
+    ap.add_argument("--corner", default="bl")
+    ap.add_argument("--no-gui", action="store_true")
+    args = ap.parse_args()
+
+    relays = [parse_addr(s) for s in args.relays.split(",")]
+    node = RovNode(args.id, relays, loss=args.loss)
+
+    if args.no_gui:
+        node.start()
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            node.stop()
+    else:
+        run_gui(node, args.corner)
+
+
+if __name__ == "__main__":
+    main()
