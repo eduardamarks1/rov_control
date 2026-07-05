@@ -21,6 +21,7 @@ import time
 
 import quiclite as q
 from protocol import compute_response, PILOT_CREDENTIALS
+from video_stream import FrameAssembler
 
 HEARTBEAT_INTERVAL = 1.0
 FAILOVER_TIMEOUT = 6.0  # maior que o PRIMARY_TIMEOUT do relay (backup assume antes)
@@ -41,6 +42,11 @@ class PilotNode:
         self.running = False
         self.authed = False
         self.controlling = None
+        self.token = None
+        self.lease_id = None
+        self.term = 0
+        self.command_seq = 0
+        self.video = FrameAssembler()
         self.last_relay_seen = time.time()
         self._connect_started = False
 
@@ -87,6 +93,8 @@ class PilotNode:
     def _register(self):
         self.authed = False
         self.controlling = None
+        self.token = None
+        self.lease_id = None
         self.last_relay_seen = time.time()
         self.endpoint.send_reliable(self.current, {
             "type": "register", "role": "pilot",
@@ -105,16 +113,33 @@ class PilotNode:
             self._log("sem controle de nenhum ROV — comando ignorado")
             return
         self.endpoint.send_reliable(self.current,
-                                    {"type": "command", "action": action, "value": value})
+                                    {"type": "command", "action": action, "value": value,
+                                     "token": self.token,
+                                     "command_seq": self.command_seq})
+        self.command_seq += 1
         self._log(f"comando enviado: {action} = {value}")
 
     def release_control(self):
         if self.controlling:
-            self.endpoint.send_reliable(self.current, {"type": "release_control"})
+            self.endpoint.send_reliable(
+                self.current, {"type": "release_control", "token": self.token})
             self._log(f"controle de '{self.controlling}' liberado")
             self.controlling = None
             self._emit({"kind": "control", "state": "released"})
 
+    def request_control(self, rov_id):
+        """Escolhe um ROV e solicita seu controle depois da autenticação."""
+        self.target = str(rov_id).strip()
+        if not self.authed:
+            self._log("autentique no relay antes de solicitar um ROV")
+            return
+        if self.controlling:
+            self._log("libere o controle atual antes de escolher outro ROV")
+            return
+        self.endpoint.send_reliable(
+            self.current, {"type": "request_control", "rov": self.target,
+                           "token": self.token})
+        self._log(f"solicitando controle de '{self.target}'")
     # -- recepção -----------------------------------------------------------
     def _on_message(self, addr, msg, reliable):
         if addr == self.current:
@@ -132,6 +157,7 @@ class PilotNode:
             self._log("desafio recebido — respondendo (HMAC do nonce)…")
         elif mtype == "auth_ok":
             self.authed = True
+            self.token = msg.get("token")
             self._log(f"AUTENTICADO no relay (token {str(msg.get('token'))[:8]}…)")
             self._emit({"kind": "auth", "state": "ok"})
         elif mtype == "auth_fail":
@@ -140,6 +166,9 @@ class PilotNode:
             self._emit({"kind": "auth", "state": "fail", "reason": msg.get("reason")})
         elif mtype == "control_granted":
             self.controlling = msg.get("rov")
+            self.lease_id = msg.get("lease_id")
+            self.term = max(self.term, int(msg.get("term", 0)))
+            self.command_seq = 0
             self._log(f"controle CONCEDIDO sobre '{self.controlling}'")
             self._emit({"kind": "control", "state": "granted", "rov": self.controlling})
         elif mtype == "control_denied":
@@ -150,12 +179,20 @@ class PilotNode:
                         "battery": msg.get("battery"), "depth": msg.get("depth"),
                         "temperature": msg.get("temperature"),
                         "thruster_power": msg.get("thruster_power")})
+        elif mtype == "video_chunk":
+            frame = self.video.add(msg)
+            if frame:
+                self._emit({"kind": "video", **frame})
         elif mtype == "rov_offline":
             self._log(f"AVISO: ROV '{msg.get('rov')}' ficou OFFLINE")
             self._emit({"kind": "control", "state": "rov_offline", "rov": msg.get("rov")})
             self.controlling = None
         elif mtype == "relay_heartbeat":
-            pass
+            self.term = max(self.term, int(msg.get("term", 0)))
+        elif mtype == "not_leader":
+            leader = msg.get("leader")
+            if leader:
+                self._switch_to(tuple(leader), reason="redirecionado pelo follower")
         elif mtype == "error":
             self._log(f"erro do relay: {msg.get('message')}")
 
@@ -183,6 +220,16 @@ class PilotNode:
         self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
                     "state": "failover"})
         self._register()  # re-registra, re-autentica e re-pede controle
+
+    def _switch_to(self, relay, reason):
+        if relay == self.current or relay not in self.relays:
+            return
+        old = self.current
+        self.endpoint.remove_peer(old)
+        self.current = relay
+        self.idx = self.relays.index(relay)
+        self._log(f"{reason}: {old[0]}:{old[1]} -> {relay[0]}:{relay[1]}")
+        self._register()
 
 
 # ===========================================================================

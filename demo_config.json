@@ -1,0 +1,12 @@
+{
+  "relays": [
+    {"role": "primary", "host": "127.0.0.1", "port": 5000},
+    {"role": "backup", "host": "127.0.0.1", "port": 5001}
+  ],
+  "rovs": [{"id": "rov1", "video": true}, {"id": "rov2", "video": true}],
+  "pilots": [
+    {"id": "pilotoA", "target": "rov1"},
+    {"id": "pilotoB", "target": "rov2"}
+  ],
+  "network": {"loss": 0.0}
+}

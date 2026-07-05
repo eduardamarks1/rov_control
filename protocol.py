@@ -40,6 +40,7 @@ Vantagens (temas de segurança em Sistemas Distribuídos):
 
 import hashlib
 import hmac
+import os
 import secrets
 
 # ---------------------------------------------------------------------------
@@ -50,8 +51,14 @@ import secrets
 # autenticar os pilotos quando assume no lugar do primário.)
 # ---------------------------------------------------------------------------
 PILOT_CREDENTIALS = {
-    "pilotoA": "mergulho2026",
-    "pilotoB": "trocaraki",
+    "pilotoA": os.getenv("ROV_PILOT_A_PASSWORD", "mergulho2026"),
+    "pilotoB": os.getenv("ROV_PILOT_B_PASSWORD", "trocaraki"),
+}
+
+ROV_CREDENTIALS = {
+    "rov1": os.getenv("ROV_1_SECRET", "rov1-device-secret"),
+    "rov2": os.getenv("ROV_2_SECRET", "rov2-device-secret"),
+    "rov3": os.getenv("ROV_3_SECRET", "rov3-device-secret"),
 }
 
 
@@ -78,9 +85,18 @@ def verify_response(pilot_id: str, nonce: str, response: str) -> bool:
     de temporização).
     """
     password = PILOT_CREDENTIALS.get(pilot_id)
-    if password is None:
+    if password is None or not nonce:
         return False
     expected = compute_response(password, nonce)
+    return hmac.compare_digest(expected, response)
+
+
+def verify_rov_response(rov_id: str, nonce: str, response: str) -> bool:
+    """Valida a prova de posse do segredo provisionado no dispositivo."""
+    secret = ROV_CREDENTIALS.get(rov_id)
+    if secret is None or not nonce:
+        return False
+    expected = compute_response(secret, nonce)
     return hmac.compare_digest(expected, response)
 
 

@@ -33,11 +33,12 @@ INTERFACE (classe RelayGUI). Isso permite testar o sistema de forma headless.
 """
 
 import argparse
+import secrets
 import threading
 import time
 
 import quiclite as q
-from protocol import gen_nonce, verify_response, new_session_token
+from protocol import gen_nonce, verify_response, verify_rov_response, new_session_token
 
 # --- Parâmetros de tempo (segundos) ---------------------------------------
 # Importante: PRIMARY_TIMEOUT (backup assume) é bem MENOR que o FAILOVER_TIMEOUT
@@ -69,9 +70,12 @@ class RelayNode:
         self.mirror_rovs = set()
         self.mirror_pilots = set()
         self.mirror_control = {}   # rov_id -> pilot_id
+        self.mirror_leases = {}
 
         # Papel ativo: o primário já nasce ativo; o backup só ao assumir.
         self.active = (role == "primary")
+        self.term = 1 if self.active else 0
+        self.leader_addr = self.bind_addr if self.active else self.peer_addr
         self.last_peer_relay = time.time()  # última vez que ouvimos o outro relay
         self.peer_down_logged = False
 
@@ -118,6 +122,8 @@ class RelayNode:
                 "kind": "state",
                 "role": self.role,
                 "active": self.active,
+                "term": self.term,
+                "leader": self.leader_addr,
                 "rovs": [
                     {"id": rid, "controlled_by": r["controlled_by"]}
                     for rid, r in sorted(self.rovs.items())
@@ -129,6 +135,7 @@ class RelayNode:
                 "mirror_rovs": sorted(self.mirror_rovs),
                 "mirror_pilots": sorted(self.mirror_pilots),
                 "mirror_control": dict(self.mirror_control),
+                "mirror_leases": dict(self.mirror_leases),
             }
         self._emit(snap)
 
@@ -152,6 +159,26 @@ class RelayNode:
         self.peer_down_logged = False
         mtype = msg.get("type")
         if mtype == "relay_ping":
+            peer_term = int(msg.get("term", 0))
+            peer_active = bool(msg.get("active"))
+            changed = False
+            with self.lock:
+                if peer_term > self.term:
+                    self.term = peer_term
+                    if peer_active:
+                        self.active = False
+                        self.leader_addr = self.peer_addr
+                    changed = True
+                elif peer_active and self.active and peer_term == self.term:
+                    # Desempate determinístico evita dois líderes no mesmo termo.
+                    winner = min(self.bind_addr, self.peer_addr)
+                    self.active = self.bind_addr == winner
+                    self.leader_addr = winner
+                    changed = True
+                elif peer_active and peer_term == self.term:
+                    self.leader_addr = self.peer_addr
+            if changed:
+                self._push_state()
             return
         if mtype == "replicate":
             self._apply_replication(msg)
@@ -164,23 +191,35 @@ class RelayNode:
             elif event == "rov_down":
                 self.mirror_rovs.discard(msg["id"])
                 self.mirror_control.pop(msg["id"], None)
+                self.mirror_leases.pop(msg["id"], None)
             elif event == "pilot_up":
                 self.mirror_pilots.add(msg["id"])
             elif event == "pilot_down":
                 self.mirror_pilots.discard(msg["id"])
                 self.mirror_control = {r: p for r, p in self.mirror_control.items()
                                        if p != msg["id"]}
+                self.mirror_leases = {r: lease for r, lease in self.mirror_leases.items()
+                                      if r in self.mirror_control}
             elif event == "control":
                 rid, pid = msg.get("rov"), msg.get("pilot")
                 if pid:
                     self.mirror_control[rid] = pid
+                    self.mirror_leases[rid] = msg.get("lease_id")
                 else:
                     self.mirror_control.pop(rid, None)
+                    self.mirror_leases.pop(rid, None)
         self._log(f"[replicação] recebido do primário: {event} {msg.get('id') or msg.get('rov') or ''}")
         self._push_state()
 
     def _on_client_message(self, addr, msg):
         mtype = msg.get("type")
+
+        if not self.active:
+            self.endpoint.send_reliable(addr, {
+                "type": "not_leader", "term": self.term,
+                "leader": list(self.leader_addr) if self.leader_addr else None,
+            })
+            return
 
         # Qualquer mensagem serve de "sinal de vida" do cliente.
         with self.lock:
@@ -195,12 +234,16 @@ class RelayNode:
             self._handle_register(addr, msg)
         elif mtype == "auth_response":
             self._handle_auth(addr, msg)
+        elif mtype == "request_control":
+            self._handle_request_control(addr, msg)
         elif mtype == "command":
             self._handle_command(addr, msg)
         elif mtype == "telemetry":
             self._handle_telemetry(addr, msg)
+        elif mtype == "video_chunk":
+            self._handle_video(addr, msg)
         elif mtype == "release_control":
-            self._handle_release(addr)
+            self._handle_release(addr, msg)
         elif mtype == "heartbeat":
             pass  # já atualizou last_seen acima
         else:
@@ -215,18 +258,29 @@ class RelayNode:
             return
 
         if role == "rov":
+            nonce = gen_nonce()
             with self.lock:
-                self.rovs[cid] = {"addr": addr, "controlled_by": None, "last_seen": time.time()}
+                previous = self.rovs.get(cid)
+                if previous and previous["addr"] != addr:
+                    self.endpoint.send_reliable(
+                        addr, {"type": "error", "message": "id de ROV já registrado"})
+                    return
+                self.rovs[cid] = {"addr": addr, "controlled_by": None,
+                                  "last_seen": time.time(), "authed": False,
+                                  "nonce": nonce, "lease_id": None}
                 self.by_addr[addr] = ("rov", cid)
-            self.endpoint.send_reliable(addr, {"type": "registered", "ok": True, "role": "rov"})
-            self._log(f"ROV '{cid}' registrado {addr}")
-            self._replicate("rov_up", id=cid)
-            # Um piloto pode já estar esperando para controlar este ROV.
-            self._try_pair_rov(cid)
+            self.endpoint.send_reliable(addr, {"type": "auth_challenge",
+                                               "role": "rov", "nonce": nonce})
+            self._log(f"ROV '{cid}' conectado {addr}; prova do dispositivo solicitada")
 
         elif role == "pilot":
             nonce = gen_nonce()
             with self.lock:
+                previous = self.pilots.get(cid)
+                if previous and previous["addr"] != addr:
+                    self.endpoint.send_reliable(
+                        addr, {"type": "error", "message": "id de piloto já conectado"})
+                    return
                 self.pilots[cid] = {"addr": addr, "controlling": None,
                                     "last_seen": time.time(), "authed": False,
                                     "nonce": nonce, "token": None,
@@ -245,9 +299,34 @@ class RelayNode:
     def _handle_auth(self, addr, msg):
         with self.lock:
             ident = self.by_addr.get(addr)
-        if not ident or ident[0] != "pilot":
+        if not ident:
             return
-        pid = ident[1]
+        role, cid = ident
+        if role == "rov":
+            with self.lock:
+                rov = self.rovs.get(cid)
+                nonce = rov.get("nonce") if rov else None
+            if rov and verify_rov_response(cid, nonce, msg.get("response", "")):
+                with self.lock:
+                    rov["authed"] = True
+                    rov["nonce"] = None
+                self.endpoint.send_reliable(
+                    addr, {"type": "registered", "ok": True, "role": "rov",
+                           "term": self.term})
+                self._log(f"ROV '{cid}' AUTENTICADO e registrado")
+                self._replicate("rov_up", id=cid)
+                self._try_pair_rov(cid)
+            else:
+                self.endpoint.send_reliable(
+                    addr, {"type": "auth_fail", "reason": "dispositivo não autorizado"})
+                with self.lock:
+                    self.rovs.pop(cid, None)
+                    self.by_addr.pop(addr, None)
+            self._push_state()
+            return
+        if role != "pilot":
+            return
+        pid = cid
         with self.lock:
             p = self.pilots.get(pid)
             nonce = p["nonce"] if p else None
@@ -259,6 +338,7 @@ class RelayNode:
             with self.lock:
                 p["authed"] = True
                 p["token"] = token
+                p["nonce"] = None
             self.endpoint.send_reliable(addr, {"type": "auth_ok", "token": token})
             self._log(f"Piloto '{pid}' AUTENTICADO (token {token[:8]}…)")
             self._replicate("pilot_up", id=pid)
@@ -310,20 +390,43 @@ class RelayNode:
             else:
                 rov["controlled_by"] = pid
                 p["controlling"] = rid
+                lease_id = secrets.token_hex(16)
+                rov["lease_id"] = lease_id
                 addr = p["addr"]
                 rov_ok = True
                 self.reserved.pop(rid, None)  # dono reassumiu / concessão normal
 
         if rov_ok:
-            self.endpoint.send_reliable(addr, {"type": "control_granted", "rov": rid})
+            self.endpoint.send_reliable(addr, {"type": "control_granted", "rov": rid,
+                                               "lease_id": lease_id, "term": self.term})
             self._log(f"Controle de '{rid}' concedido a '{pid}'")
-            self._replicate("control", rov=rid, pilot=pid)
+            self._replicate("control", rov=rid, pilot=pid, lease_id=lease_id)
         else:
             self.endpoint.send_reliable(addr, {"type": "control_denied",
                                                "rov": deny[1], "reason": deny[0]})
             self._log(f"Controle de '{deny[1]}' NEGADO a '{pid}': {deny[0]}")
         self._push_state()
 
+    def _handle_request_control(self, addr, msg):
+        """Permite escolher o ROV somente depois da autenticação do piloto."""
+        with self.lock:
+            ident = self.by_addr.get(addr)
+            pilot = self.pilots.get(ident[1]) if ident and ident[0] == "pilot" else None
+            target = str(msg.get("rov", "")).strip()
+            if pilot and pilot["authed"] and not pilot.get("controlling") and target:
+                pilot["target"] = target
+                pid, reason = ident[1], None
+            else:
+                pid = None
+                reason = ("libere o controle atual antes de escolher outro ROV"
+                          if pilot and pilot.get("controlling") else
+                          "ROV alvo inválido" if pilot and pilot["authed"] else
+                          "piloto não autenticado")
+        if pid:
+            self._try_grant_control(pid)
+        else:
+            self.endpoint.send_reliable(
+                addr, {"type": "control_denied", "rov": target, "reason": reason})
     def _try_pair_rov(self, rid):
         """Quando um ROV entra, procura um piloto autenticado esperando por ele."""
         with self.lock:
@@ -347,12 +450,14 @@ class RelayNode:
             p = self.pilots.get(pid) if pid else None
             if p is None:
                 target_addr = None
-            elif not p["authed"]:
+            elif not p["authed"] or not secrets.compare_digest(
+                    str(p.get("token") or ""), str(msg.get("token") or "")):
                 target_addr = "unauth"
             else:
                 rid = p["controlling"]
                 rov = self.rovs.get(rid) if rid else None
                 target_addr = rov["addr"] if rov else None
+                lease_id = rov.get("lease_id") if rov else None
 
         if p is None:
             return
@@ -366,12 +471,17 @@ class RelayNode:
         # Encaminha o comando pelo canal CONFIÁVEL (não pode se perder).
         self.endpoint.send_reliable(target_addr, {"type": "command", "from": pid,
                                                   "action": msg.get("action"),
-                                                  "value": msg.get("value")})
+                                                  "value": msg.get("value"), "term": self.term,
+                                                  "lease_id": lease_id,
+                                                  "command_seq": msg.get("command_seq")})
 
     def _handle_telemetry(self, addr, msg):
         with self.lock:
             ident = self.by_addr.get(addr)
             rid = ident[1] if ident and ident[0] == "rov" else None
+            rov_info = self.rovs.get(rid) if rid else None
+            if not rov_info or not rov_info.get("authed"):
+                return
             controller = self.rovs.get(rid, {}).get("controlled_by") if rid else None
             dest = self.pilots.get(controller, {}).get("addr") if controller else None
         if dest:
@@ -380,13 +490,30 @@ class RelayNode:
             # Telemetria segue pelo canal NÃO-CONFIÁVEL até o piloto.
             self.endpoint.send_unreliable(dest, fwd)
 
-    def _handle_release(self, addr):
+    def _handle_video(self, addr, msg):
+        with self.lock:
+            ident = self.by_addr.get(addr)
+            rid = ident[1] if ident and ident[0] == "rov" else None
+            rov = self.rovs.get(rid) if rid else None
+            controller = rov.get("controlled_by") if rov and rov.get("authed") else None
+            dest = self.pilots.get(controller, {}).get("addr") if controller else None
+        if dest and msg.get("rov") in (None, rid):
+            fwd = dict(msg)
+            fwd["rov"] = rid
+            self.endpoint.send_unreliable(dest, fwd)
+
+    def _handle_release(self, addr, msg):
         with self.lock:
             ident = self.by_addr.get(addr)
             pid = ident[1] if ident and ident[0] == "pilot" else None
-            rid = self.pilots.get(pid, {}).get("controlling") if pid else None
+            pilot = self.pilots.get(pid, {}) if pid else {}
+            if not pilot or not secrets.compare_digest(
+                    str(pilot.get("token") or ""), str(msg.get("token") or "")):
+                return
+            rid = pilot.get("controlling")
             if rid and rid in self.rovs:
                 self.rovs[rid]["controlled_by"] = None
+                self.rovs[rid]["lease_id"] = None
             if pid and pid in self.pilots:
                 self.pilots[pid]["controlling"] = None
         if pid:
@@ -450,7 +577,8 @@ class RelayNode:
             # Pinga o outro relay (para ele saber que estamos vivos).
             if self.peer_addr:
                 self.endpoint.send_unreliable(self.peer_addr,
-                                              {"type": "relay_ping", "role": self.role})
+                                              {"type": "relay_ping", "role": self.role,
+                                               "active": self.active, "term": self.term})
 
             # Anuncia-se aos clientes conectados: é isso que permite ao cliente
             # detectar a QUEDA do relay (se estes pings pararem, ele faz failover).
@@ -458,7 +586,8 @@ class RelayNode:
                 addrs = [r["addr"] for r in self.rovs.values()] + \
                         [p["addr"] for p in self.pilots.values()]
                 active = self.active
-            hb = {"type": "relay_heartbeat", "role": self.role, "active": active}
+            hb = {"type": "relay_heartbeat", "role": self.role, "active": active,
+                  "term": self.term}
             for a in addrs:
                 self.endpoint.send_unreliable(a, hb)
 
@@ -468,6 +597,8 @@ class RelayNode:
                 if self.role == "backup" and not self.active and silent > PRIMARY_TIMEOUT:
                     with self.lock:
                         self.active = True
+                        self.term += 1
+                        self.leader_addr = self.bind_addr
                         # Usa o estado replicado para reservar os controles aos
                         # donos anteriores durante a janela de failover.
                         self.reserved = dict(self.mirror_control)

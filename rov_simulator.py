@@ -22,10 +22,13 @@ import threading
 import time
 
 import quiclite as q
+from protocol import compute_response, ROV_CREDENTIALS
+from video_stream import generate_ppm, fragment_frame
 
 TELEMETRY_INTERVAL = 1.5
 HEARTBEAT_INTERVAL = 1.0
 FAILOVER_TIMEOUT = 6.0    # relay mudo por mais que isso => trocar de relay
+VIDEO_INTERVAL = 0.5
 # (maior que o PRIMARY_TIMEOUT do relay, para o backup assumir antes)
 
 
@@ -65,13 +68,16 @@ class RovState:
 
 
 class RovNode:
-    def __init__(self, rov_id, relays, loss=0.0, on_event=None):
+    def __init__(self, rov_id, relays, loss=0.0, on_event=None,
+                 device_secret=None, video=True):
         self.rov_id = rov_id
         self.relays = relays            # lista de (ip, porta), [primário, backup]
         self.idx = 0
         self.current = relays[0]
         self.loss = loss
         self.on_event = on_event
+        self.device_secret = device_secret or ROV_CREDENTIALS.get(rov_id, "invalid-device")
+        self.video_enabled = video
 
         self.state = RovState()
         self.endpoint = None
@@ -79,17 +85,33 @@ class RovNode:
         self.registered = False
         self.last_relay_seen = time.time()
         self.relay_role = "?"
+        self.highest_term = 0
+        self.active_lease = None
+        self.last_command_seq = -1
+        self._connect_started = False
 
     # -- infraestrutura -----------------------------------------------------
-    def start(self):
+    def start(self, autoconnect=True):
         sock = q.make_udp_socket(("0.0.0.0", 0))  # porta efêmera qualquer
         self.endpoint = q.Endpoint(sock, self._on_message, loss=self.loss,
                                    name=f"rov-{self.rov_id}")
         self.running = True
-        self._register()
         threading.Thread(target=self._telemetry_loop, daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
         threading.Thread(target=self._failover_monitor, daemon=True).start()
+        if self.video_enabled:
+            threading.Thread(target=self._video_loop, daemon=True).start()
+        if autoconnect:
+            self.connect()
+        else:
+            self._emit({"kind": "conn", "state": "idle", "rov": self.rov_id})
+
+    def connect(self):
+        """Inicia autenticação e registro do dispositivo no relay."""
+        if self._connect_started:
+            return
+        self._connect_started = True
+        self._register()
 
     def stop(self):
         self.running = False
@@ -105,6 +127,8 @@ class RovNode:
         self._emit({"kind": "log", "text": text})
 
     def _register(self):
+        if not self._connect_started:
+            return
         self.registered = False
         self.last_relay_seen = time.time()
         self.endpoint.send_reliable(self.current,
@@ -118,12 +142,30 @@ class RovNode:
         if addr == self.current:
             self.last_relay_seen = time.time()
         mtype = msg.get("type")
-        if mtype == "registered":
+        if mtype == "auth_challenge" and msg.get("role") == "rov":
+            response = compute_response(self.device_secret, msg.get("nonce", ""))
+            self.endpoint.send_reliable(
+                self.current, {"type": "auth_response", "response": response})
+            self._log("desafio do dispositivo recebido — enviando prova HMAC")
+        elif mtype == "registered":
             self.registered = True
+            self.highest_term = max(self.highest_term, int(msg.get("term", 0)))
             self._log(f"conectado ao relay {self.current[0]}:{self.current[1]}")
             self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
                         "state": "connected"})
         elif mtype == "command":
+            term = int(msg.get("term", 0))
+            lease = msg.get("lease_id")
+            command_seq = int(msg.get("command_seq", -1))
+            if term < self.highest_term:
+                self._log(f"comando rejeitado: termo obsoleto {term} < {self.highest_term}")
+                return
+            if term > self.highest_term or lease != self.active_lease:
+                self.highest_term, self.active_lease, self.last_command_seq = term, lease, -1
+            if not lease or command_seq <= self.last_command_seq:
+                self._log("comando rejeitado: lease inválida ou sequência duplicada")
+                return
+            self.last_command_seq = command_seq
             action, value = msg.get("action"), msg.get("value")
             self.state.apply_command(action, value)
             self._log(f"comando de '{msg.get('from')}': {action} = {value}")
@@ -132,6 +174,13 @@ class RovNode:
             self._emit({"kind": "telemetry", **self.state.snapshot()})
         elif mtype == "relay_heartbeat":
             self.relay_role = msg.get("role", "?")
+            self.highest_term = max(self.highest_term, int(msg.get("term", 0)))
+        elif mtype == "not_leader":
+            leader = msg.get("leader")
+            if leader:
+                self._switch_to(tuple(leader), reason="redirecionado pelo follower")
+        elif mtype == "auth_fail":
+            self._log(f"AUTENTICAÇÃO DO ROV FALHOU: {msg.get('reason')}")
         elif mtype == "error":
             self._log(f"erro do relay: {msg.get('message')}")
 
@@ -141,19 +190,31 @@ class RovNode:
             self.state.tick()
             snap = self.state.snapshot()
             # Telemetria vai pelo canal NÃO-CONFIÁVEL (último valor vence).
-            self.endpoint.send_unreliable(self.current, {"type": "telemetry", **snap})
+            if self.registered:
+                self.endpoint.send_unreliable(self.current, {"type": "telemetry", **snap})
             self._emit({"kind": "telemetry", **snap})
             time.sleep(TELEMETRY_INTERVAL)
 
     def _heartbeat_loop(self):
         while self.running:
-            self.endpoint.send_unreliable(self.current, {"type": "heartbeat"})
+            if self.registered:
+                self.endpoint.send_unreliable(self.current, {"type": "heartbeat"})
             time.sleep(HEARTBEAT_INTERVAL)
+
+    def _video_loop(self):
+        frame_id = 0
+        while self.running:
+            if self.registered:
+                ppm = generate_ppm(frame_id)
+                for chunk in fragment_frame(self.rov_id, frame_id, ppm):
+                    self.endpoint.send_unreliable(self.current, chunk)
+                frame_id += 1
+            time.sleep(VIDEO_INTERVAL)
 
     def _failover_monitor(self):
         while self.running:
             time.sleep(0.5)
-            if len(self.relays) < 2:
+            if not self._connect_started or len(self.relays) < 2:
                 continue
             if time.time() - self.last_relay_seen > FAILOVER_TIMEOUT:
                 self._failover()
@@ -167,6 +228,16 @@ class RovNode:
                   f"{self.current[0]}:{self.current[1]}")
         self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
                     "state": "failover"})
+        self._register()
+
+    def _switch_to(self, relay, reason):
+        if relay == self.current or relay not in self.relays:
+            return
+        old = self.current
+        self.endpoint.remove_peer(old)
+        self.current = relay
+        self.idx = self.relays.index(relay)
+        self._log(f"{reason}: {old[0]}:{old[1]} -> {relay[0]}:{relay[1]}")
         self._register()
 
 
@@ -264,12 +335,16 @@ def main():
     ap.add_argument("--relays", default="127.0.0.1:5000,127.0.0.1:5001",
                     help="lista de relays separados por vírgula (primário,backup)")
     ap.add_argument("--loss", type=float, default=0.0)
+    ap.add_argument("--device-secret", default=None,
+                    help="segredo provisionado no ROV (ou variável ROV_<N>_SECRET)")
+    ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--corner", default="bl")
     ap.add_argument("--no-gui", action="store_true")
     args = ap.parse_args()
 
     relays = [parse_addr(s) for s in args.relays.split(",")]
-    node = RovNode(args.id, relays, loss=args.loss)
+    node = RovNode(args.id, relays, loss=args.loss,
+                   device_secret=args.device_secret, video=not args.no_video)
 
     if args.no_gui:
         node.start()
