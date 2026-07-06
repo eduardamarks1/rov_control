@@ -17,7 +17,7 @@ CONCEITOS DE SISTEMAS DISTRIBUÍDOS NESTE ARQUIVO:
 4) Detecção de falhas: heartbeats + `_liveness_monitor` derrubam clientes que
    ficaram mudos.
 
-5) Autenticação: pilotos passam por desafio-resposta HMAC antes de controlar.
+5) Autenticação: pilotos passam por RSA-PSS + Diffie-Hellman efêmero antes de controlar.
 
 6) REPLICAÇÃO e TOLERÂNCIA A FALHAS DO PRÓPRIO RELAY (a novidade principal):
    rodamos DOIS relays em esquema PRIMÁRIO-BACKUP.
@@ -38,7 +38,13 @@ import threading
 import time
 
 import quiclite as q
-from protocol import gen_nonce, verify_response, verify_rov_response, new_session_token
+from dh_exchange import (
+    GROUP_ID, confirmation_transcript, decode_public, derive_session_key,
+    encode_public, fingerprint,
+    generate_keypair, transcript,
+)
+from identity_keys import load_private_key, sign_transcript, verify_transcript
+from protocol import gen_nonce, new_session_token
 
 # --- Parâmetros de tempo (segundos) ---------------------------------------
 # Importante: PRIMARY_TIMEOUT (backup assume) é bem MENOR que o FAILOVER_TIMEOUT
@@ -55,6 +61,7 @@ class RelayNode:
 
     def __init__(self, role, bind_addr, peer_addr=None, loss=0.0, on_event=None):
         self.role = role                 # 'primary' ou 'backup'
+        self.identity_key = load_private_key("relay", role)
         self.bind_addr = bind_addr       # (ip, porta) onde este relay escuta
         self.peer_addr = peer_addr       # (ip, porta) do OUTRO relay
         self.loss = loss
@@ -261,6 +268,7 @@ class RelayNode:
 
         if role == "rov":
             nonce = gen_nonce()
+            dh_private, dh_public = generate_keypair()
             with self.lock:
                 previous = self.rovs.get(cid)
                 if previous and previous["addr"] != addr:
@@ -269,14 +277,20 @@ class RelayNode:
                     return
                 self.rovs[cid] = {"addr": addr, "controlled_by": None,
                                   "last_seen": time.time(), "authed": False,
-                                  "nonce": nonce, "lease_id": None}
+                                  "nonce": nonce, "lease_id": None,
+                                  "dh_private": dh_private, "dh_public": dh_public,
+                                  "session_key": None}
                 self.by_addr[addr] = ("rov", cid)
             self.endpoint.send_reliable(addr, {"type": "auth_challenge",
-                                               "role": "rov", "nonce": nonce})
+                                               "role": "rov", "nonce": nonce,
+                                               "dh_group": GROUP_ID,
+                                               "dh_public": encode_public(dh_public),
+                                               "relay_identity": self.role})
             self._log(f"ROV '{cid}' conectado {addr}; prova do dispositivo solicitada")
 
         elif role == "pilot":
             nonce = gen_nonce()
+            dh_private, dh_public = generate_keypair()
             with self.lock:
                 previous = self.pilots.get(cid)
                 if previous and previous["addr"] != addr:
@@ -286,11 +300,15 @@ class RelayNode:
                 self.pilots[cid] = {"addr": addr, "controlling": None,
                                     "last_seen": time.time(), "authed": False,
                                     "nonce": nonce, "token": None,
+                                    "dh_private": dh_private, "dh_public": dh_public,
+                                    "session_key": None,
                                     "target": msg.get("target")}
                 self.by_addr[addr] = ("pilot", cid)
             self.endpoint.send_reliable(addr, {"type": "registered", "ok": True,
                                                "role": "pilot", "need_auth": True})
-            self.endpoint.send_reliable(addr, {"type": "auth_challenge", "nonce": nonce})
+            self.endpoint.send_reliable(addr, {"type": "auth_challenge", "nonce": nonce, "dh_group": GROUP_ID,
+                                               "dh_public": encode_public(dh_public),
+                                               "relay_identity": self.role})
             self._log(f"Piloto '{cid}' conectou {addr}; desafio de autenticação enviado")
         else:
             self.endpoint.send_reliable(addr, {"type": "error", "message": "role inválido"})
@@ -301,58 +319,70 @@ class RelayNode:
     def _handle_auth(self, addr, msg):
         with self.lock:
             ident = self.by_addr.get(addr)
-        if not ident:
-            return
-        role, cid = ident
-        if role == "rov":
-            with self.lock:
-                rov = self.rovs.get(cid)
-                nonce = rov.get("nonce") if rov else None
-            if rov and verify_rov_response(cid, nonce, msg.get("response", "")):
-                with self.lock:
-                    rov["authed"] = True
-                    rov["nonce"] = None
-                self.endpoint.send_reliable(
-                    addr, {"type": "registered", "ok": True, "role": "rov",
-                           "term": self.term})
-                self._log(f"ROV '{cid}' AUTENTICADO e registrado")
-                self._replicate("rov_up", id=cid)
-                self._try_pair_rov(cid)
-            else:
-                self.endpoint.send_reliable(
-                    addr, {"type": "auth_fail", "reason": "dispositivo não autorizado"})
-                with self.lock:
-                    self.rovs.pop(cid, None)
-                    self.by_addr.pop(addr, None)
-            self._push_state()
-            return
-        if role != "pilot":
-            return
-        pid = cid
-        with self.lock:
-            p = self.pilots.get(pid)
-            nonce = p["nonce"] if p else None
-        if p is None:
+            session = (self.rovs if ident and ident[0] == "rov" else self.pilots).get(
+                ident[1]) if ident else None
+        if not ident or not session:
             return
 
-        if verify_response(pid, nonce, msg.get("response", "")):
+        role, cid = ident
+        nonce = session.get("nonce")
+        try:
+            if int(msg.get("dh_group", -1)) != GROUP_ID:
+                raise ValueError("grupo DH não suportado")
+            client_public = decode_public(msg.get("dh_public"))
+            hs = transcript(role, cid, nonce, client_public, session["dh_public"])
+            authenticated = verify_transcript(
+                role, cid, hs, msg.get("signature", "")
+            )
+            key = (derive_session_key(session["dh_private"], client_public, nonce, hs)
+                   if authenticated else None)
+        except (KeyError, TypeError, ValueError):
+            authenticated, key = False, None
+
+        if not authenticated:
+            reason = ("dispositivo não autorizado" if role == "rov"
+                      else "assinatura RSA inválida")
+            self.endpoint.send_reliable(
+                addr, {"type": "auth_fail", "reason": reason})
+            self._log(f"{role.upper()} '{cid}' FALHOU na assinatura RSA-PSS")
+            with self.lock:
+                (self.rovs if role == "rov" else self.pilots).pop(cid, None)
+                self.by_addr.pop(addr, None)
+            self._push_state()
+            return
+
+        key_id = fingerprint(key)
+        relay_signature = sign_transcript(
+            self.identity_key, confirmation_transcript(hs, key_id)
+        )
+        with self.lock:
+            session["authed"] = True
+            session["nonce"] = None
+            session["session_key"] = key
+            session.pop("dh_private", None)
+            session.pop("dh_public", None)
+
+        if role == "rov":
+            self.endpoint.send_reliable(
+                addr, {"type": "registered", "ok": True, "role": "rov",
+                       "term": self.term, "key_fingerprint": key_id,
+                       "relay_identity": self.role,
+                       "relay_signature": relay_signature})
+            self._log(f"ROV '{cid}' AUTENTICADO; chave de sessão DH {key_id}")
+            self._replicate("rov_up", id=cid)
+            self._try_pair_rov(cid)
+        else:
             token = new_session_token()
             with self.lock:
-                p["authed"] = True
-                p["token"] = token
-                p["nonce"] = None
-            self.endpoint.send_reliable(addr, {"type": "auth_ok", "token": token})
-            self._log(f"Piloto '{pid}' AUTENTICADO (token {token[:8]}…)")
-            self._replicate("pilot_up", id=pid)
-            if p.get("target"):
-                self._try_grant_control(pid)
-        else:
-            self.endpoint.send_reliable(addr, {"type": "auth_fail",
-                                               "reason": "credenciais inválidas"})
-            self._log(f"Piloto '{pid}' FALHOU na autenticação — sessão recusada")
-            with self.lock:
-                self.pilots.pop(pid, None)
-                self.by_addr.pop(addr, None)
+                session["token"] = token
+            self.endpoint.send_reliable(
+                addr, {"type": "auth_ok", "token": token,
+                       "key_fingerprint": key_id, "relay_identity": self.role,
+                       "relay_signature": relay_signature})
+            self._log(f"Piloto '{cid}' AUTENTICADO; chave de sessão DH {key_id}")
+            self._replicate("pilot_up", id=cid)
+            if session.get("target"):
+                self._try_grant_control(cid)
         self._push_state()
 
     # -- controle (exclusão mútua) -----------------------------------------

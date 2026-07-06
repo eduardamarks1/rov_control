@@ -47,7 +47,7 @@ Há **dois modos de execução** dos mesmos nós, e em ambos a comunicação é 
 | Arquivo | Papel |
 |---|---|
 | `quiclite.py` | **Transporte inspirado no QUIC**: sobre UDP, com um canal confiável e ordenado (seq/ACK/retransmissão) e um canal não-confiável, + simulação de perda de pacotes. |
-| `protocol.py` | Mensagens do protocolo + **autenticação desafio-resposta HMAC**. |
+| `protocol.py`, `dh_exchange.py`, `identity_keys.py` | Nonces, DH efêmero, HKDF e autenticação mútua por RSA-PSS. |
 | `relay_server.py` | Relay (primário/backup): registro, exclusão mútua, heartbeat, auth, **replicação e failover**. Lógica (`RelayNode`) separada da GUI. |
 | `rov_simulator.py` | ROV simulado: telemetria, aplica comandos, **failover** automático. |
 | `pilot_client.py` | Piloto: autentica, pede controle, envia comandos, recebe telemetria, **failover**. |
@@ -107,16 +107,14 @@ python relay_server.py --role backup  --port 5001 --peer 127.0.0.1:5000 --corner
 # ROV
 python rov_simulator.py --id rov1 --relays 127.0.0.1:5000,127.0.0.1:5001 --corner bl
 
-# Piloto (a senha de demonstração é preenchida automaticamente)
+# Piloto (a chave RSA local é carregada automaticamente)
 python pilot_client.py --id pilotoA --target rov1 --relays 127.0.0.1:5000,127.0.0.1:5001 --corner br
 ```
 
 > Para rodar em **máquinas diferentes** na mesma rede, troque `127.0.0.1`
 > pelos IPs reais e use `--host 0.0.0.0` nos relays.
 
-Credenciais de demonstração (em `protocol.py`): `pilotoA` / `mergulho2026`,
-`pilotoB` / `trocaraki`. Para mostrar a autenticação **falhando**, passe uma
-senha errada: `python pilot_client.py --id pilotoA --password errada`.
+As identidades RSA de demonstração são provisionadas em `identity_keys/` no primeiro uso. As chaves privadas ficam locais e os relays verificam apenas as chaves públicas. Para usar um PEM específico, passe `--private-key caminho.pem`.
 
 ---
 
@@ -128,9 +126,9 @@ senha errada: `python pilot_client.py --id pilotoA --password errada`.
    **ROV na água** (dir.). Os relays e o ROV já estão no ar; **o piloto começa
    desconectado** de propósito.
 2. **Conexão + autenticação ao vivo:** clique **"Conectar Piloto A"**. Veja os
-   pacotes azuis (registro → desafio → resposta HMAC) voando até o RELAY P, o nó
+   pacotes azuis (registro → DH efêmero → assinatura RSA-PSS) voando até o RELAY P, o nó
    do piloto virar "autenticado" e depois "controla ✓". O log embaixo mostra o
-   processo; explique que a **senha nunca trafega** (só o HMAC do nonce).
+   processo; explique que **chaves privadas e a chave de sessão nunca trafegam**.
 3. **Controle + telemetria:** use **Frente/Ré/Parar** com o slider de potência.
    O ROV **desce/sobe** na água, solta bolhas e a bateria cai — e os pacotes de
    comando (azul) e telemetria (cinza) aparecem na topologia.
@@ -170,7 +168,7 @@ senha errada: `python pilot_client.py --id pilotoA --password errada`.
 | Canais independentes / *head-of-line blocking* | `send_reliable` (comandos) vs `send_unreliable` (telemetria): a perda em um não trava o outro. |
 | Detecção de falhas / heartbeat | `heartbeat` + `RelayNode._liveness_monitor` (clientes) e `relay_heartbeat` (relay↔cliente). |
 | Exclusão mútua / concorrência | `RelayNode._try_grant_control` — um piloto por ROV. |
-| Autenticação (segurança) | Desafio-resposta HMAC em `protocol.py` + fluxo em `RelayNode._handle_auth`. |
+| Autenticação (segurança) | RSA-PSS mútuo + DH efêmero + HKDF em `identity_keys.py`, `dh_exchange.py` e `RelayNode._handle_auth`. |
 | Registro distribuído de sessões | Dicionários `rovs`/`pilots` no relay. |
 | **Replicação** | `RelayNode._replicate` (primário → backup) e `_apply_replication` (espelho). |
 | **Tolerância a falhas do servidor / failover** | Promoção do backup (`_heartbeat_loop`), migração dos clientes (`_failover`) e **preservação de posse** via reserva a partir do estado replicado (`_reservation_blocks`). |

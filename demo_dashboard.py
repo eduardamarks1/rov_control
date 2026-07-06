@@ -9,7 +9,6 @@ from tkinter import ttk
 import gui_common as g
 from demo_config import load_config, relay_addresses
 from pilot_client import PilotNode
-from protocol import PILOT_CREDENTIALS
 from quiclite import PKT_ACK, PKT_DATA_REL, PKT_DATA_UNREL
 from relay_server import RelayNode
 from rov_simulator import RovNode
@@ -35,8 +34,7 @@ class Dashboard:
         self.pilots = {}
         for spec in config["pilots"]:
             pid = spec["id"]
-            self.pilots[pid] = PilotNode(pid, PILOT_CREDENTIALS.get(pid, "senha-invalida"),
-                                         None, [PRIMARY, BACKUP])
+            self.pilots[pid] = PilotNode(pid, None, None, [PRIMARY, BACKUP])
         self.pilot_ids, self.rov_ids = list(self.pilots), list(self.rovs)
         self.active_pilot = tk.StringVar(value=self.pilot_ids[0])
         self.target_vars = {pid: tk.StringVar(value=self.rov_ids[0]) for pid in self.pilot_ids}

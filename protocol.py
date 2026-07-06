@@ -17,87 +17,19 @@ quiclite (UDP), escolhendo o canal certo para cada uma:
     heartbeat, telemetry, relay_heartbeat, relay_ping
 
 
-AUTENTICAÇÃO DO PILOTO (desafio-resposta com HMAC):
------------------------------------------------------
-Não queremos mandar a senha em texto puro pela rede. Então usamos o esquema
-clássico de desafio-resposta:
+AUTENTICAÇÃO MÚTUA + ACORDO DE CHAVE:
+--------------------------------------
+Cada piloto, ROV e relay possui uma chave privada RSA local. As chaves
+públicas cadastradas verificam assinaturas RSA-PSS do transcript DH. Cliente
+e relay geram chaves Diffie-Hellman efêmeras, assinam a negociação e derivam
+uma chave de sessão com HKDF-SHA256. Nonces impedem replay e uma nova sessão é
+negociada após cada conexão ou failover. Ver dh_exchange.py e identity_keys.py."""
 
-  1. Piloto -> Relay:  register (role=pilot, id=pilotoA)
-  2. Relay -> Piloto:  auth_challenge (nonce aleatório de uso único)
-  3. Piloto -> Relay:  auth_response (HMAC-SHA256(senha_do_piloto, nonce))
-  4. Relay verifica recalculando o mesmo HMAC com a senha que ele conhece:
-       - bate  -> auth_ok (+ token de sessão) e segue para conceder controle
-       - não   -> auth_fail
-
-Vantagens (temas de segurança em Sistemas Distribuídos):
-  * A senha NUNCA trafega pela rede -- só o HMAC dela com o nonce.
-  * O nonce é de uso único e aleatório, então capturar um auth_response antigo
-    e reenviá-lo (ataque de REPLAY) não funciona: o próximo desafio terá outro
-    nonce.
-  * Depois do login, o relay emite um TOKEN de sessão, identificando a sessão
-    autenticada.
-"""
-
-import hashlib
-import hmac
-import os
 import secrets
-
-# ---------------------------------------------------------------------------
-# "Banco de credenciais" conhecido pelos relays. Em um sistema real isso
-# estaria em um servidor de identidade / banco de dados protegido; aqui é um
-# dicionário fixo só para a demonstração. Cada piloto tem uma senha.
-# (Os dois relays carregam a MESMA tabela, por isso o backup também consegue
-# autenticar os pilotos quando assume no lugar do primário.)
-# ---------------------------------------------------------------------------
-PILOT_CREDENTIALS = {
-    "pilotoA": os.getenv("ROV_PILOT_A_PASSWORD", "mergulho2026"),
-    "pilotoB": os.getenv("ROV_PILOT_B_PASSWORD", "trocaraki"),
-}
-
-ROV_CREDENTIALS = {
-    "rov1": os.getenv("ROV_1_SECRET", "rov1-device-secret"),
-    "rov2": os.getenv("ROV_2_SECRET", "rov2-device-secret"),
-    "rov3": os.getenv("ROV_3_SECRET", "rov3-device-secret"),
-}
-
 
 def gen_nonce() -> str:
     """Gera um desafio aleatório de uso único (32 hex = 128 bits)."""
     return secrets.token_hex(16)
-
-
-def compute_response(password: str, nonce: str) -> str:
-    """
-    Resposta do piloto ao desafio: HMAC-SHA256 usando a senha como chave e o
-    nonce como mensagem. Determinístico para (senha, nonce) -> o relay
-    consegue recalcular e comparar.
-    """
-    return hmac.new(password.encode("utf-8"),
-                    nonce.encode("utf-8"),
-                    hashlib.sha256).hexdigest()
-
-
-def verify_response(pilot_id: str, nonce: str, response: str) -> bool:
-    """
-    O relay verifica a resposta: procura a senha do piloto, recalcula o HMAC
-    esperado e compara em tempo constante (hmac.compare_digest evita ataques
-    de temporização).
-    """
-    password = PILOT_CREDENTIALS.get(pilot_id)
-    if password is None or not nonce:
-        return False
-    expected = compute_response(password, nonce)
-    return hmac.compare_digest(expected, response)
-
-
-def verify_rov_response(rov_id: str, nonce: str, response: str) -> bool:
-    """Valida a prova de posse do segredo provisionado no dispositivo."""
-    secret = ROV_CREDENTIALS.get(rov_id)
-    if secret is None or not nonce:
-        return False
-    expected = compute_response(secret, nonce)
-    return hmac.compare_digest(expected, response)
 
 
 def new_session_token() -> str:

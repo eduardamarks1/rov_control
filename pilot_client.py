@@ -4,7 +4,7 @@ pilot_client.py
 O Host do PILOTO. Fluxo:
 
   1. Registra-se no relay dizendo qual ROV quer controlar.
-  2. AUTENTICA-SE por desafio-resposta HMAC (a senha nunca vai pela rede).
+  2. AUTENTICA-SE por RSA-PSS + Diffie-Hellman efêmero (a senha nunca vai pela rede).
   3. Se autenticar, pede o controle do ROV (o relay garante exclusão mútua:
      só um piloto por ROV).
   4. Envia COMANDOS (canal confiável) e recebe TELEMETRIA (canal
@@ -20,7 +20,11 @@ import threading
 import time
 
 import quiclite as q
-from protocol import compute_response, PILOT_CREDENTIALS
+from dh_exchange import (
+    GROUP_ID, confirmation_transcript, decode_public, derive_session_key,
+    encode_public, fingerprint, generate_keypair, transcript,
+)
+from identity_keys import load_private_key, sign_transcript, verify_transcript
 from video_stream import FrameAssembler
 
 HEARTBEAT_INTERVAL = 1.0
@@ -28,9 +32,9 @@ FAILOVER_TIMEOUT = 6.0  # maior que o PRIMARY_TIMEOUT do relay (backup assume an
 
 
 class PilotNode:
-    def __init__(self, pilot_id, password, target, relays, loss=0.0, on_event=None):
+    def __init__(self, pilot_id, private_key, target, relays, loss=0.0, on_event=None):
         self.pilot_id = pilot_id
-        self.password = password
+        self.identity_key = load_private_key("pilot", pilot_id, private_key)
         self.target = target
         self.relays = relays
         self.idx = 0
@@ -43,6 +47,9 @@ class PilotNode:
         self.authed = False
         self.controlling = None
         self.token = None
+        self.session_key = None
+        self.auth_transcript = None
+        self.auth_relay_identity = None
         self.lease_id = None
         self.term = 0
         self.command_seq = 0
@@ -94,6 +101,9 @@ class PilotNode:
         self.authed = False
         self.controlling = None
         self.token = None
+        self.session_key = None
+        self.auth_transcript = None
+        self.auth_relay_identity = None
         self.lease_id = None
         self.last_relay_seen = time.time()
         self.endpoint.send_reliable(self.current, {
@@ -150,15 +160,42 @@ class PilotNode:
             self._emit({"kind": "conn", "relay": f"{self.current[0]}:{self.current[1]}",
                         "state": "connected"})
         elif mtype == "auth_challenge":
-            # Responde ao desafio: HMAC(senha, nonce). A senha não trafega.
             nonce = msg.get("nonce")
-            resp = compute_response(self.password, nonce)
-            self.endpoint.send_reliable(self.current, {"type": "auth_response", "response": resp})
-            self._log("desafio recebido — respondendo (HMAC do nonce)…")
+            relay_identity = msg.get("relay_identity")
+            try:
+                relay_public = decode_public(msg.get("dh_public"))
+                private, public = generate_keypair()
+                hs = transcript("pilot", self.pilot_id, nonce, public, relay_public)
+                signature = sign_transcript(self.identity_key, hs)
+                self.session_key = derive_session_key(private, relay_public, nonce, hs)
+                self.auth_transcript = hs
+                self.auth_relay_identity = relay_identity
+            except ValueError as exc:
+                self._log(f"troca DH recusada: {exc}")
+                return
+            self.endpoint.send_reliable(
+                self.current, {"type": "auth_response", "dh_group": GROUP_ID,
+                               "dh_public": encode_public(public),
+                               "signature": signature})
+            self._log("chave DH efêmera enviada; transcript assinado com RSA-PSS")
         elif mtype == "auth_ok":
+            expected = fingerprint(self.session_key) if self.session_key else None
+            relay_ok = bool(expected and self.auth_transcript and verify_transcript(
+                "relay", self.auth_relay_identity,
+                confirmation_transcript(self.auth_transcript, expected),
+                msg.get("relay_signature", ""),
+            ))
+            if (not relay_ok or msg.get("relay_identity") != self.auth_relay_identity
+                    or msg.get("key_fingerprint") != expected):
+                self.authed = False
+                self.session_key = None
+                self.auth_transcript = None
+                self.auth_relay_identity = None
+                self._log("AUTENTICAÇÃO FALHOU: assinatura do relay ou chave DH divergiu")
+                return
             self.authed = True
             self.token = msg.get("token")
-            self._log(f"AUTENTICADO no relay (token {str(msg.get('token'))[:8]}…)")
+            self._log(f"AUTENTICADO; chave de sessão DH {expected}")
             self._emit({"kind": "auth", "state": "ok"})
         elif mtype == "auth_fail":
             self.authed = False
@@ -367,8 +404,8 @@ def parse_addr(s):
 def main():
     ap = argparse.ArgumentParser(description="Cliente do piloto")
     ap.add_argument("--id", default="pilotoA")
-    ap.add_argument("--password", default=None,
-                    help="senha do piloto (se omitida, usa a de demonstração)")
+    ap.add_argument("--private-key", default=None,
+                    help="arquivo PEM da chave privada RSA do piloto")
     ap.add_argument("--target", default="rov1")
     ap.add_argument("--relays", default="127.0.0.1:5000,127.0.0.1:5001")
     ap.add_argument("--loss", type=float, default=0.0)
@@ -376,12 +413,8 @@ def main():
     ap.add_argument("--no-gui", action="store_true")
     args = ap.parse_args()
 
-    password = args.password
-    if password is None:
-        password = PILOT_CREDENTIALS.get(args.id, "senha-invalida")
-
     relays = [parse_addr(s) for s in args.relays.split(",")]
-    node = PilotNode(args.id, password, args.target, relays, loss=args.loss)
+    node = PilotNode(args.id, args.private_key, args.target, relays, loss=args.loss)
 
     if args.no_gui:
         node.start()

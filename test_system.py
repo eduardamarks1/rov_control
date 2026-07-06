@@ -5,7 +5,7 @@ Teste de integração HEADLESS (sem interface gráfica): sobe dois relays, um
 ROV e dois pilotos no mesmo processo e verifica, com asserções, cada conceito
 de Sistemas Distribuídos que o projeto demonstra:
 
-  1. Autenticação (desafio-resposta HMAC) — senha certa entra, senha errada não.
+  1. Autenticação (RSA-PSS + Diffie-Hellman efêmero) — chave cadastrada entra, chave não cadastrada não.
   2. Controle de concorrência (exclusão mútua) — só um piloto por ROV.
   3. Roteamento de comando (canal confiável) — o ROV reage ao comando.
   4. Replicação — o backup espelha o estado do primário.
@@ -20,7 +20,7 @@ import time
 from relay_server import RelayNode
 from rov_simulator import RovNode
 from pilot_client import PilotNode
-from protocol import PILOT_CREDENTIALS
+from identity_keys import generate_untrusted_private_key
 
 PRIMARY = ("127.0.0.1", 5100)
 BACKUP = ("127.0.0.1", 5101)
@@ -47,10 +47,10 @@ def main():
     backup.start()
     time.sleep(1.5)
 
-    print("== Subindo ROV e piloto A (senha correta) ==")
+    print("== Subindo ROV e piloto A (chave RSA cadastrada) ==")
     rov = RovNode("rov1", [PRIMARY, BACKUP])
     rov.start()
-    pilotA = PilotNode("pilotoA", PILOT_CREDENTIALS["pilotoA"], "rov1", [PRIMARY, BACKUP])
+    pilotA = PilotNode("pilotoA", None, "rov1", [PRIMARY, BACKUP])
     pilotA.start()
     time.sleep(2.5)
 
@@ -66,16 +66,16 @@ def main():
     check(f"profundidade aumentou após comando ({depth_before} -> {depth_after})",
           depth_after > depth_before)
 
-    print("\n-- 3) Autenticação com senha ERRADA é recusada --")
-    pilotBad = PilotNode("pilotoB", "senha-errada", "rov1", [PRIMARY, BACKUP])
+    print("\n-- 3) Autenticação com chave RSA NÃO CADASTRADA é recusada --")
+    pilotBad = PilotNode("pilotoB", generate_untrusted_private_key(), "rov1", [PRIMARY, BACKUP])
     pilotBad.start()
     time.sleep(2.5)
-    check("piloto com senha errada NÃO autenticou", not pilotBad.authed)
+    check("piloto com chave não cadastrada NÃO autenticou", not pilotBad.authed)
     pilotBad.stop()
     time.sleep(0.5)
 
-    print("\n-- 4) Concorrência: piloto B (senha certa) tenta o mesmo ROV --")
-    pilotB = PilotNode("pilotoB", PILOT_CREDENTIALS["pilotoB"], "rov1", [PRIMARY, BACKUP])
+    print("\n-- 4) Concorrência: piloto B (chave cadastrada) tenta o mesmo ROV --")
+    pilotB = PilotNode("pilotoB", None, "rov1", [PRIMARY, BACKUP])
     pilotB.start()
     time.sleep(2.5)
     check("piloto B autenticou", pilotB.authed)

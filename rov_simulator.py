@@ -22,7 +22,11 @@ import threading
 import time
 
 import quiclite as q
-from protocol import compute_response, ROV_CREDENTIALS
+from dh_exchange import (
+    GROUP_ID, confirmation_transcript, decode_public, derive_session_key,
+    encode_public, fingerprint, generate_keypair, transcript,
+)
+from identity_keys import load_private_key, sign_transcript, verify_transcript
 from video_stream import generate_ppm, fragment_frame
 
 TELEMETRY_INTERVAL = 1.5
@@ -69,20 +73,23 @@ class RovState:
 
 class RovNode:
     def __init__(self, rov_id, relays, loss=0.0, on_event=None,
-                 device_secret=None, video=True):
+                 private_key=None, video=True):
         self.rov_id = rov_id
         self.relays = relays            # lista de (ip, porta), [primário, backup]
         self.idx = 0
         self.current = relays[0]
         self.loss = loss
         self.on_event = on_event
-        self.device_secret = device_secret or ROV_CREDENTIALS.get(rov_id, "invalid-device")
+        self.identity_key = load_private_key("rov", rov_id, private_key)
         self.video_enabled = video
 
         self.state = RovState()
         self.endpoint = None
         self.running = False
         self.registered = False
+        self.session_key = None
+        self.auth_transcript = None
+        self.auth_relay_identity = None
         self.last_relay_seen = time.time()
         self.relay_role = "?"
         self.highest_term = 0
@@ -130,6 +137,9 @@ class RovNode:
         if not self._connect_started:
             return
         self.registered = False
+        self.session_key = None
+        self.auth_transcript = None
+        self.auth_relay_identity = None
         self.last_relay_seen = time.time()
         self.endpoint.send_reliable(self.current,
                                     {"type": "register", "role": "rov", "id": self.rov_id})
@@ -143,11 +153,39 @@ class RovNode:
             self.last_relay_seen = time.time()
         mtype = msg.get("type")
         if mtype == "auth_challenge" and msg.get("role") == "rov":
-            response = compute_response(self.device_secret, msg.get("nonce", ""))
+            nonce = msg.get("nonce", "")
+            relay_identity = msg.get("relay_identity")
+            try:
+                relay_public = decode_public(msg.get("dh_public"))
+                private, public = generate_keypair()
+                hs = transcript("rov", self.rov_id, nonce, public, relay_public)
+                signature = sign_transcript(self.identity_key, hs)
+                self.session_key = derive_session_key(private, relay_public, nonce, hs)
+                self.auth_transcript = hs
+                self.auth_relay_identity = relay_identity
+            except ValueError as exc:
+                self._log(f"troca DH recusada: {exc}")
+                return
             self.endpoint.send_reliable(
-                self.current, {"type": "auth_response", "response": response})
-            self._log("desafio do dispositivo recebido — enviando prova HMAC")
+                self.current, {"type": "auth_response", "dh_group": GROUP_ID,
+                               "dh_public": encode_public(public),
+                               "signature": signature})
+            self._log("chave DH efêmera enviada; transcript assinado com RSA-PSS")
         elif mtype == "registered":
+            expected = fingerprint(self.session_key) if self.session_key else None
+            relay_ok = bool(expected and self.auth_transcript and verify_transcript(
+                "relay", self.auth_relay_identity,
+                confirmation_transcript(self.auth_transcript, expected),
+                msg.get("relay_signature", ""),
+            ))
+            if (not relay_ok or msg.get("relay_identity") != self.auth_relay_identity
+                    or msg.get("key_fingerprint") != expected):
+                self.registered = False
+                self.session_key = None
+                self.auth_transcript = None
+                self.auth_relay_identity = None
+                self._log("AUTENTICAÇÃO DO ROV FALHOU: assinatura do relay ou chave DH divergiu")
+                return
             self.registered = True
             self.highest_term = max(self.highest_term, int(msg.get("term", 0)))
             self._log(f"conectado ao relay {self.current[0]}:{self.current[1]}")
@@ -335,8 +373,8 @@ def main():
     ap.add_argument("--relays", default="127.0.0.1:5000,127.0.0.1:5001",
                     help="lista de relays separados por vírgula (primário,backup)")
     ap.add_argument("--loss", type=float, default=0.0)
-    ap.add_argument("--device-secret", default=None,
-                    help="segredo provisionado no ROV (ou variável ROV_<N>_SECRET)")
+    ap.add_argument("--private-key", default=None,
+                    help="arquivo PEM da chave privada RSA do ROV")
     ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--corner", default="bl")
     ap.add_argument("--no-gui", action="store_true")
@@ -344,7 +382,7 @@ def main():
 
     relays = [parse_addr(s) for s in args.relays.split(",")]
     node = RovNode(args.id, relays, loss=args.loss,
-                   device_secret=args.device_secret, video=not args.no_video)
+                   private_key=args.private_key, video=not args.no_video)
 
     if args.no_gui:
         node.start()

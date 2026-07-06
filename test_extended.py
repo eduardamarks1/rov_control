@@ -3,7 +3,7 @@ import time
 
 from demo_config import validate_config
 from pilot_client import PilotNode
-from protocol import PILOT_CREDENTIALS, ROV_CREDENTIALS
+from identity_keys import generate_untrusted_private_key
 from relay_server import RelayNode
 from rov_simulator import RovNode
 from video_stream import FrameAssembler, fragment_frame, generate_ppm
@@ -65,10 +65,10 @@ def main():
     video_events = []
     rov1 = RovNode("rov1", [PRIMARY, BACKUP], video=True)
     rov2 = RovNode("rov2", [PRIMARY, BACKUP], video=False)
-    bad_rov = RovNode("rov3", [PRIMARY, BACKUP], device_secret="segredo-errado", video=False)
-    pilot_a = PilotNode("pilotoA", PILOT_CREDENTIALS["pilotoA"], "rov1",
+    bad_rov = RovNode("rov3", [PRIMARY, BACKUP], private_key=generate_untrusted_private_key(), video=False)
+    pilot_a = PilotNode("pilotoA", None, "rov1",
                         [PRIMARY, BACKUP], on_event=lambda e: video_events.append(e))
-    pilot_b = PilotNode("pilotoB", PILOT_CREDENTIALS["pilotoB"], "rov2",
+    pilot_b = PilotNode("pilotoB", None, "rov2",
                         [PRIMARY, BACKUP])
     nodes += [rov1, rov2, bad_rov, pilot_a, pilot_b]
     for node in (rov1, rov2, bad_rov, pilot_a, pilot_b):
@@ -77,7 +77,7 @@ def main():
     try:
         check("dois ROVs autenticam", wait_until(
             lambda: rov1.registered and rov2.registered))
-        check("ROV com segredo inválido é recusado", wait_until(
+        check("ROV com chave RSA não cadastrada é recusado", wait_until(
             lambda: not bad_rov.registered and "rov3" not in primary.rovs, timeout=3))
         check("pilotos controlam ROVs independentes", wait_until(
             lambda: pilot_a.controlling == "rov1" and pilot_b.controlling == "rov2"))
@@ -95,8 +95,7 @@ def main():
         check("comando autenticado funciona", wait_until(
             lambda: rov1.state.snapshot()["depth"] > depth, timeout=2))
 
-        follower_client = RovNode("rov3", [BACKUP, PRIMARY],
-                                  device_secret=ROV_CREDENTIALS["rov3"], video=False)
+        follower_client = RovNode("rov3", [BACKUP, PRIMARY], video=False)
         nodes.append(follower_client)
         follower_client.start()
         check("follower redireciona cliente ao líder", wait_until(
